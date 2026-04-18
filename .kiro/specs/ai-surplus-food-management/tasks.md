@@ -1,0 +1,344 @@
+# Implementation Plan: AI-Driven Surplus Food Management System
+
+## Overview
+
+Incremental implementation starting with project scaffolding and data models, building up through backend services and pure-function engines, then wiring the REST API, and finally constructing the React frontend with role-based routing. Property-based tests (fast-check) are placed immediately after each pure function is implemented to catch regressions early.
+
+## Tasks
+
+- [x] 1. Project scaffolding and shared configuration
+  - Create `backend/` directory with `src/` sub-folders: `models/`, `routes/`, `services/`, `middleware/`, `utils/`, `tests/`
+  - Create `frontend/` directory with standard Create-React-App or Vite structure: `src/pages/`, `src/components/`, `src/context/`, `src/api/`
+  - Add `backend/package.json` with dependencies: `express`, `mongoose`, `bcryptjs`, `jsonwebtoken`, `nodemailer`, `pdfkit`, `dotenv`, `cors`, `crypto`; devDependencies: `jest`, `supertest`, `@jest/globals`, `fast-check`, `mongodb-memory-server`, `ts-jest`, `typescript`, `@types/*`
+  - Add `frontend/package.json` with dependencies: `react`, `react-dom`, `react-router-dom`, `axios`, `recharts`; devDependencies: `@testing-library/react`, `@testing-library/jest-dom`, `vitest`
+  - Create `backend/.env.example` with `MONGO_URI`, `JWT_SECRET`, `PORT`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `APP_BASE_URL` placeholders (no real values)
+  - Create `backend/src/app.ts` wiring Express, CORS, JSON body parser, and a health-check route `GET /health`
+  - Create `backend/src/server.ts` that connects to MongoDB then starts the HTTP server
+  - _Requirements: 12.4_
+
+- [x] 2. MongoDB data models
+  - [x] 2.1 Implement User Mongoose model
+    - Define schema with `email` (unique, required), `passwordHash`, `role` (enum `restaurant|ngo|admin`), `orgName`, `location.lat`, `location.lng`, `isVerified` (Boolean, default `false`), `verificationCode` (String, nullable), `verificationCodeExpiry` (Date, nullable), `resetToken` (String, nullable), `resetTokenExpiry` (Date, nullable), `createdAt`
+    - Export `UserModel` from `backend/src/models/User.ts`
+    - _Requirements: 1.1, 13.1, 14.1_
+  - [x] 2.2 Implement FoodListing Mongoose model
+    - Define schema with `restaurantId` (ref User), `foodName`, `quantity` (> 0), `expiryDatetime`, `location.lat/lng`, `status` (enum `available|claimed|delivered`, default `available`), `foodType`, `createdAt`
+    - Export `FoodListingModel` from `backend/src/models/FoodListing.ts`
+    - _Requirements: 2.1, 2.5_
+  - [x] 2.3 Implement FoodRequest Mongoose model
+    - Define schema with `listingId` (ref FoodListing), `ngoId` (ref User), `restaurantId` (ref User, denormalized), `status` (enum `requested|accepted|delivered`, default `requested`), `createdAt`, `updatedAt`
+    - Export `FoodRequestModel` from `backend/src/models/FoodRequest.ts`
+    - _Requirements: 3.3, 3.6_
+  - [x] 2.4 Implement Notification Mongoose model
+    - Define schema with `userId` (ref User), `message`, `type`, `read` (default `false`), `createdAt`
+    - Export `NotificationModel` from `backend/src/models/Notification.ts`
+    - _Requirements: 10.1, 10.2_
+
+- [x] 3. Auth service, email service, and middleware
+  - [x] 3.1 Implement Email Service
+    - Create `backend/src/services/emailService.ts` with:
+      - `sendVerificationEmail(to, code)` — sends email with 6-digit code via Nodemailer using `SMTP_*` env vars
+      - `sendPasswordResetEmail(to, resetLink)` — sends email with reset link (`APP_BASE_URL/reset-password?token=...`)
+    - Use a transporter configured from env vars; throw a typed error if sending fails
+    - _Requirements: 13.1, 14.1_
+  - [x] 3.2 Implement Auth Service
+    - Create `backend/src/services/authService.ts` with:
+      - `register(email, password, role, orgName, location)` — creates user with `isVerified: false`, generates 6-digit code, stores hashed code + 15-min expiry, calls `sendVerificationEmail`; throws on duplicate email
+      - `verifyEmail(email, code)` — validates code and expiry, sets `isVerified: true`, clears code fields, returns JWT
+      - `resendVerification(email)` — invalidates old code, generates new 6-digit code with fresh 15-min expiry, calls `sendVerificationEmail`
+      - `login(email, password)` — validates credentials; returns 403 if `isVerified: false`; returns JWT on success
+      - `forgotPassword(email)` — generates `crypto.randomBytes(32)` Reset_Token, stores hashed version + 1-hour expiry, calls `sendPasswordResetEmail`; returns same response regardless of whether email exists
+      - `resetPassword(token, newPassword)` — finds user by hashed token, checks expiry, validates password length ≥ 8, updates `passwordHash`, clears reset token fields
+    - Hash passwords with `bcryptjs` (salt rounds 10); sign JWT with 24-hour expiry using `JWT_SECRET` from env
+    - _Requirements: 1.2, 1.3, 1.4, 1.5, 1.7, 13.1, 13.2, 13.3, 13.4, 13.5, 13.6, 13.7, 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7_
+  - [x] 3.3 Implement JWT middleware and role guard
+    - Create `backend/src/middleware/auth.ts` exporting `authenticateToken(req, res, next)` that validates Bearer token and attaches `req.user`
+    - Create `requireRole(...roles)` higher-order middleware that checks `req.user.role` and returns 403 if insufficient
+    - Return 401 with `{ error: "Unauthorized" }` for missing/expired tokens; 403 with `{ error: "Forbidden" }` for wrong role
+    - _Requirements: 1.6, 8.5, 8.6_
+  - [x] 3.4 Implement Auth routes
+    - Create `backend/src/routes/authRoutes.ts` with:
+      - `POST /auth/register` — validate required fields, call `register`, return 201 with message
+      - `POST /auth/login` — validate fields, call `login`, return token; return 403 if unverified
+      - `POST /auth/verify-email` — accept `{ email, code }`, call `verifyEmail`, return token
+      - `POST /auth/resend-verification` — accept `{ email }`, call `resendVerification`
+      - `POST /auth/forgot-password` — accept `{ email }`, call `forgotPassword`, always return 200
+      - `POST /auth/reset-password` — accept `{ token, newPassword }`, call `resetPassword`
+    - Mount router in `app.ts`
+    - _Requirements: 1.2, 1.3, 1.4, 1.5, 13.2, 13.6, 14.1, 14.3_
+
+- [x] 4. Haversine calculator utility
+  - [x] 4.1 Implement `haversine` pure function
+    - Create `backend/src/utils/haversine.ts` exporting `haversine(lat1, lng1, lat2, lng2): number`
+    - Validate inputs: throw `ValidationError` if lat outside [−90, 90] or lng outside [−180, 180]
+    - Implement great-circle formula; return distance in km
+    - _Requirements: 6.1, 6.4, 6.5_
+  - [x] 4.2 Write property test — Property 1: Haversine Symmetry
+    - **Property 1: Haversine Symmetry** — generate random valid coordinate pairs; assert `haversine(A,B) === haversine(B,A)`
+    - **Validates: Requirements 6.5**
+    - Tag: `Feature: ai-surplus-food-management, Property 1: Haversine Symmetry`
+    - Use `fc.float` bounded to valid lat/lng ranges; `numRuns: 100`
+  - [x] 4.3 Write property test — Property 2: Haversine Coordinate Validation
+    - **Property 2: Haversine Coordinate Validation** — generate out-of-range coordinates; assert `ValidationError` is thrown and no numeric distance is returned
+    - **Validates: Requirements 6.4**
+    - Tag: `Feature: ai-surplus-food-management, Property 2: Haversine Coordinate Validation`
+    - Use `fc.oneof` to produce lat > 90, lat < −90, lng > 180, lng < −180; `numRuns: 100`
+
+- [x] 5. Matching Engine
+  - [x] 5.1 Implement `rankListings` pure function
+    - Create `backend/src/services/matchingEngine.ts` exporting `rankListings(input: MatchInput): FoodListing[]`
+    - Compute `distanceScore`, `urgencyScore`, `quantityScore` each normalized to [0,1]; composite = `0.4×dist + 0.4×urgency + 0.2×qty`
+    - Sort descending by composite score; attach `score` field to each listing in the returned array
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
+  - [x] 5.2 Write property test — Property 3: Matching Engine Preserves All Listings
+    - **Property 3: Matching Engine Preserves All Listings** — generate random non-empty listing arrays and valid NGO coords; assert `rankListings(input).length === input.length`
+    - **Validates: Requirements 4.7**
+    - Tag: `Feature: ai-surplus-food-management, Property 3: Matching Engine Preserves All Listings`
+    - `numRuns: 100`
+  - [x] 5.3 Write property test — Property 4: Matching Engine Idempotence
+    - **Property 4: Matching Engine Idempotence** — apply `rankListings` twice; assert the IDs in the output are in the same order both times
+    - **Validates: Requirements 4.8**
+    - Tag: `Feature: ai-surplus-food-management, Property 4: Matching Engine Idempotence`
+    - `numRuns: 100`
+  - [x] 5.4 Write property test — Property 5: Score Normalization and Monotonicity
+    - **Property 5: Matching Engine Score Normalization and Monotonicity** — assert every composite score ∈ [0,1]; generate pairs of listings differing in one factor and assert the more-favorable listing scores strictly higher
+    - **Validates: Requirements 4.3, 4.4, 4.5, 4.6**
+    - Tag: `Feature: ai-surplus-food-management, Property 5: Score Normalization and Monotonicity`
+    - `numRuns: 100`
+
+- [x] 6. Prediction Engine
+  - [x] 6.1 Implement `predictSurplus` pure function
+    - Create `backend/src/services/predictionEngine.ts` exporting `predictSurplus(input: PredictionInput): PredictionResult`
+    - Filter history by `foodType` and `dayOfWeek`; compute weighted average of quantities
+    - Return `confidence: 'low'` + `predictedQty: 5` when < 3 records; `'medium'` for 3–9; `'high'` for ≥ 10
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
+  - [x] 6.2 Write property test — Property 6: Prediction Confidence and Default Estimate
+    - **Property 6: Prediction Engine Confidence and Default Estimate** — generate history arrays of size 0–2 (expect `low` + qty 5), 3–9 (expect `medium`), ≥ 10 (expect `high`); assert result always contains `predictedQty`, `foodType`, `targetDay`, `confidence`
+    - **Validates: Requirements 5.3, 5.5**
+    - Tag: `Feature: ai-surplus-food-management, Property 6: Prediction Confidence and Default Estimate`
+    - `numRuns: 100`
+
+- [x] 7. Checkpoint — core pure functions
+  - Ensure all unit and property tests for `haversine`, `rankListings`, and `predictSurplus` pass. Ask the user if questions arise.
+
+- [x] 8. Food routes and service
+  - [x] 8.1 Implement Food Service
+    - Create `backend/src/services/foodService.ts` with:
+      - `createListing(restaurantId, body)` — validates fields, creates FoodListing, returns record
+      - `getAvailableListings(ngoLat, ngoLng)` — fetches `available` listings, runs `rankListings`, returns sorted array with distance field
+      - `acceptRequest(ngoId, listingId)` — checks listing status, creates FoodRequest, updates listing to `claimed`, triggers notification
+      - `updateRequestStatus(restaurantId, requestId, status)` — updates FoodRequest, triggers notification on `accepted`/`delivered`
+      - `getMyListings(restaurantId)` — returns restaurant's listings ordered by `createdAt` desc
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 3.1, 3.3, 3.4, 3.5, 3.6, 6.3_
+  - [x] 8.2 Implement Food routes
+    - Create `backend/src/routes/foodRoutes.ts` with:
+      - `POST /addFood` — `requireRole('restaurant')`, validate body, call `createListing`
+      - `GET /availableFood` — `authenticateToken`, call `getAvailableListings` or `getMyListings` based on role
+      - `POST /acceptRequest` — `requireRole('ngo')`, call `acceptRequest`
+      - `PATCH /requests/:id/status` — `requireRole('restaurant')`, call `updateRequestStatus`
+      - `GET /myListings` — `requireRole('restaurant')`, call `getMyListings`
+    - Mount router in `app.ts`
+    - _Requirements: 8.1, 8.2, 8.3_
+  - [x] 8.3 Write property test — Property 8: Food Posting Input Validation
+    - **Property 8: Food Posting Input Validation** — generate invalid inputs (empty/whitespace `foodName`, `quantity ≤ 0`, past `expiryDatetime`); assert service throws validation error and no FoodListing is created in DB
+    - **Validates: Requirements 2.2, 2.3, 2.4**
+    - Tag: `Feature: ai-surplus-food-management, Property 8: Food Posting Input Validation`
+    - `numRuns: 100`
+  - [x] 8.4 Write property test — Property 9: Claiming an Already-Claimed Listing Is Rejected
+    - **Property 9: Claiming an Already-Claimed Listing Is Rejected** — set listing status to `claimed` or `delivered`; assert `acceptRequest` returns error and no new FoodRequest is created
+    - **Validates: Requirements 3.4**
+    - Tag: `Feature: ai-surplus-food-management, Property 9: Claiming an Already-Claimed Listing Is Rejected`
+    - `numRuns: 100`
+
+- [x] 9. Analytics service and route
+  - [x] 9.1 Implement Analytics Service
+    - Create `backend/src/services/analyticsService.ts` with `getAnalytics(from?: Date, to?: Date): Promise<AnalyticsResult>`
+    - Query FoodListings with `status: 'delivered'`; apply optional date range filter on `updatedAt`
+    - Compute `totalKgSaved`, `totalDonations`, `estimatedPeopleFed = totalKgSaved × 2`, `estimatedCO2Reduced = totalKgSaved × 2.5`
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5_
+  - [x] 9.2 Implement Analytics route
+    - Create `backend/src/routes/analyticsRoutes.ts` with `GET /analytics` — `authenticateToken`, parse optional `from`/`to` query params as ISO dates, call `getAnalytics`
+    - Mount router in `app.ts`
+    - _Requirements: 8.4_
+  - [x] 9.3 Write property test — Property 7: Analytics Formula Correctness
+    - **Property 7: Analytics Formula Correctness** — generate sets of FoodListings with mixed statuses and optional date ranges; assert only `delivered` listings contribute, `estimatedPeopleFed = W × 2`, `estimatedCO2Reduced = W × 2.5`
+    - **Validates: Requirements 7.2, 7.3, 7.4, 7.5**
+    - Tag: `Feature: ai-surplus-food-management, Property 7: Analytics Formula Correctness`
+    - `numRuns: 100`
+
+- [x] 10. Notification service and routes
+  - [x] 10.1 Implement Notification Service
+    - Create `backend/src/services/notificationService.ts` with:
+      - `createNotification(userId, message, type)` — inserts Notification record
+      - `getUnreadNotifications(userId)` — returns notifications where `read: false`
+      - `markAsRead(notificationId)` — sets `read: true`
+    - Wire `createNotification` calls into `foodService.ts` for request creation and status transitions to `accepted`/`delivered`
+    - _Requirements: 10.1, 10.2, 10.3, 10.4_
+  - [x] 10.2 Implement Notification routes
+    - Create `backend/src/routes/notificationRoutes.ts` with:
+      - `GET /notifications` — `authenticateToken`, call `getUnreadNotifications(req.user.id)`
+      - `PATCH /notifications/:id/read` — `authenticateToken`, call `markAsRead`
+    - Mount router in `app.ts`
+    - _Requirements: 10.3, 10.4_
+  - [x] 10.3 Write property test — Property 10: Notification Created on Relevant Events
+    - **Property 10: Notification Lifecycle** — simulate FoodRequest creation (assert 1 unread notification for restaurant); simulate status transition to `accepted`/`delivered` (assert 1 unread notification for NGO); mark as read and assert it no longer appears in unread results
+    - **Validates: Requirements 10.1, 10.2, 10.4**
+    - Tag: `Feature: ai-surplus-food-management, Property 10: Notification Lifecycle`
+    - `numRuns: 100`
+  - [x] 10.4 Write property test — Property 11: Email Verification Code Lifecycle
+    - **Property 11: Email Verification Code Lifecycle** — generate valid codes submitted within 15 minutes (assert account verified, token returned); generate expired codes (assert error, account not verified); generate wrong codes (assert error); assert verified code cannot be reused
+    - **Validates: Requirements 13.1, 13.2, 13.3, 13.4, 13.7**
+    - Tag: `Feature: ai-surplus-food-management, Property 11: Email Verification Code Lifecycle`
+    - `numRuns: 100`
+  - [x] 10.5 Write property test — Property 12: Password Reset Token Lifecycle
+    - **Property 12: Password Reset Token Lifecycle** — generate valid tokens submitted within 1 hour with password ≥ 8 chars (assert password updated, token invalidated); generate expired tokens (assert error); generate invalid tokens (assert error); assert used token cannot be reused
+    - **Validates: Requirements 14.1, 14.3, 14.4, 14.5, 14.7**
+    - Tag: `Feature: ai-surplus-food-management, Property 12: Password Reset Token Lifecycle`
+    - `numRuns: 100`
+
+- [x] 11. PDF Exporter and CSR report route
+  - [x] 11.1 Implement PDF Exporter
+    - Create `backend/src/services/pdfExporter.ts` with `generateCSRReport(analytics: AnalyticsResult): Promise<Buffer>`
+    - Use `pdfkit` to build a document containing: report generation date, total food saved, number of donations, estimated people fed, estimated CO2 reduced
+    - Throw a typed error on generation failure; never return partial buffer
+    - _Requirements: 11.1, 11.2, 11.4_
+  - [x] 11.2 Implement PDF export route
+    - Create `backend/src/routes/pdfRoutes.ts` with `GET /export/csr-report` — `requireRole('admin')`, call `getAnalytics` then `generateCSRReport`, set `Content-Disposition: attachment; filename="csr-report-{YYYY-MM-DD}.pdf"` header, pipe buffer to response
+    - Return 500 `{ error: "Report generation failed" }` on failure
+    - Mount router in `app.ts`
+    - _Requirements: 11.1, 11.2, 11.3, 11.4_
+
+- [x] 12. Checkpoint — full backend API
+  - Ensure all backend unit, property, and integration tests pass. Ask the user if questions arise.
+
+- [x] 13. Integration tests for API endpoints
+  - [x] 13.1 Set up Supertest + MongoDB Memory Server test harness
+    - Create `backend/src/tests/setup.ts` that starts `MongoMemoryServer`, connects Mongoose, and tears down after all tests
+    - _Requirements: 8.5, 8.6, 8.7_
+  - [x] 13.2 Write integration tests for Auth endpoints
+    - Test `POST /auth/register` happy path (returns message, not token), duplicate email (409), missing fields (400)
+    - Test `POST /auth/login` happy path, invalid credentials (401), unverified account (403)
+    - Test `POST /auth/verify-email` correct code (returns token), wrong code (400), expired code (400)
+    - Test `POST /auth/resend-verification` invalidates old code and issues new one
+    - Test `POST /auth/forgot-password` always returns 200 for both registered and unregistered emails
+    - Test `POST /auth/reset-password` valid token (updates password), invalid token (400), expired token (400), short password (400)
+    - _Requirements: 1.2, 1.3, 1.4, 1.5, 13.2, 13.3, 13.4, 13.5, 13.6, 14.1, 14.2, 14.3, 14.4, 14.5, 14.6_
+  - [x] 13.3 Write integration tests for Food endpoints
+    - Test `POST /addFood` happy path, validation errors, missing token (401), wrong role (403)
+    - Test `GET /availableFood` returns sorted listings for NGO
+    - Test `POST /acceptRequest` happy path and already-claimed error (409)
+    - Test `PATCH /requests/:id/status` happy path
+    - Test `GET /myListings` returns only the authenticated restaurant's listings
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 3.1, 3.3, 3.4, 3.6, 8.1, 8.2, 8.3_
+  - [x] 13.4 Write integration tests for Analytics and PDF endpoints
+    - Test `GET /analytics` with and without date range filter
+    - Test `GET /export/csr-report` returns PDF attachment for admin; 403 for non-admin
+    - _Requirements: 7.1, 7.5, 11.3_
+  - [x] 13.5 Write integration tests for Notification endpoints
+    - Test `GET /notifications` returns only unread notifications for authenticated user
+    - Test `PATCH /notifications/:id/read` marks notification and excludes it from subsequent unread responses
+    - _Requirements: 10.3, 10.4_
+
+- [x] 14. React frontend — Auth pages
+  - [x] 14.1 Implement AuthContext and API client
+    - Create `frontend/src/context/AuthContext.tsx` storing `token`, `user` (id, role, orgName) in state and `localStorage`
+    - Create `frontend/src/api/client.ts` (axios instance) that attaches `Authorization: Bearer <token>` header from context
+    - Expose `login(email, password)`, `register(...)`, `verifyEmail(email, code)`, `resendVerification(email)`, `forgotPassword(email)`, and `resetPassword(token, newPassword)` functions that call backend and update context
+    - _Requirements: 1.4, 1.6_
+  - [x] 14.2 Implement Login and Register pages
+    - Create `frontend/src/pages/Login.tsx` with email/password form; display error messages from API; include a "Forgot password?" link to `/forgot-password`
+    - Create `frontend/src/pages/Register.tsx` with email, password, orgName, role selector, lat/lng fields; display validation errors; on success redirect to `/verify-email` with email in state
+    - On successful login, store token via `AuthContext` and redirect to role-appropriate dashboard
+    - _Requirements: 1.2, 1.4, 9.1, 9.2, 9.4_
+  - [x] 14.3 Implement Email Verification page
+    - Create `frontend/src/pages/VerifyEmail.tsx` with a 6-digit code input field and a "Verify" button
+    - Display the email address being verified (passed via router state); show error messages for invalid/expired codes
+    - Include a "Resend code" button that calls `resendVerification` and shows a cooldown timer
+    - On successful verification, store token via `AuthContext` and redirect to role-appropriate dashboard
+    - _Requirements: 13.2, 13.3, 13.4, 13.6_
+  - [x] 14.4 Implement Forgot Password and Reset Password pages
+    - Create `frontend/src/pages/ForgotPassword.tsx` with an email input; on submit call `forgotPassword` and display a confirmation message regardless of outcome (prevents email enumeration)
+    - Create `frontend/src/pages/ResetPassword.tsx` that reads `token` from URL query params; render a new password + confirm password form; validate passwords match and length ≥ 8 client-side; call `resetPassword` on submit; on success redirect to `/login` with a success message
+    - Display descriptive error messages for invalid/expired tokens
+    - _Requirements: 14.1, 14.3, 14.4, 14.5, 14.6_
+
+- [x] 15. React frontend — Role-based routing
+  - Create `frontend/src/components/PrivateRoute.tsx` that reads role from `AuthContext`; redirects to permitted dashboard if role mismatch; redirects to `/login` if unauthenticated
+  - Define routes in `frontend/src/App.tsx`: `/login`, `/register`, `/verify-email`, `/forgot-password`, `/reset-password`, `/restaurant`, `/ngo`, `/admin` — dashboard routes wrapped in `PrivateRoute` with the correct role
+  - _Requirements: 9.5, 13.2, 14.3_
+
+- [x] 16. React frontend — Restaurant Dashboard
+  - [x] 16.1 Implement food posting form
+    - Create `frontend/src/pages/RestaurantDashboard.tsx` with a form for `foodName`, `quantity`, `expiryDatetime`, `foodType`, `location.lat`, `location.lng`
+    - Validate fields client-side (non-empty name, positive quantity, future expiry) and display inline errors before submitting
+    - On success, append new listing to the listings table without full page reload
+    - Display a "Predicted surplus for tomorrow" section per food type using `GET /predict` (predicted qty + confidence badge: Low / Medium / High)
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 9.1, 15.3_
+  - [x] 16.2 Implement listings table with request status
+    - Fetch `GET /myListings` on mount; render table with columns: food name, quantity, expiry, status, food type
+    - For each listing with an associated request, display current request status (`requested`, `accepted`, `delivered`) and a status-update dropdown for the restaurant
+    - Call `PATCH /requests/:id/status` on status change
+    - _Requirements: 2.6, 3.5, 3.6, 9.1, 9.3_
+
+- [x] 17. React frontend — NGO Dashboard
+  - Create `frontend/src/pages/NGODashboard.tsx`
+  - Fetch `GET /availableFood` on mount; render cards sorted by composite score (highest first)
+  - Each card shows: food name, quantity, food type, distance (km), time until expiry, composite score as an "AI Score" badge (e.g. `AI: 0.87`), and an "Accept" button
+  - Display urgency labels on each card: 🔴 High urgency (expiry ≤ 2 hours), 🟡 Medium urgency (expiry ≤ 6 hours), 🟢 Best match on the top-ranked listing
+  - On "Accept" click, call `POST /acceptRequest`; disable button and show status on success; display error if listing already claimed
+  - Show current request status for listings the NGO has already claimed
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.7, 3.8, 6.3, 9.2, 9.3, 15.1, 15.2_
+
+- [x] 18. React frontend — Admin / CSR Dashboard
+  - Create `frontend/src/pages/AdminDashboard.tsx`
+  - Fetch `GET /analytics` on mount; display metric cards: total kg saved, total donations, estimated people fed, estimated CO2 reduced
+  - Add optional date-range picker (from/to) that re-fetches analytics with query params
+  - Render graphical charts using `recharts`: a bar or line chart showing donations over time, and a summary chart (e.g. bar chart) comparing food saved, estimated people fed, and CO2 reduced
+  - Add "Export PDF" button that calls `GET /export/csr-report` and triggers browser file download
+  - _Requirements: 7.1, 7.6, 7.7, 9.4, 11.1, 11.3_
+
+- [x] 19. React frontend — Notifications display
+  - Create `frontend/src/components/NotificationBell.tsx` that fetches `GET /notifications` on mount and polls every 10 seconds using `setInterval`
+  - Display unread count badge on the bell icon; render a dropdown list of unread notification messages
+  - On clicking a notification, call `PATCH /notifications/:id/read` and remove it from the unread list
+  - Include `NotificationBell` in the shared navigation bar rendered on all authenticated dashboards
+  - _Requirements: 10.3, 10.4, 10.5_
+
+- [x] 20. Checkpoint — full frontend
+  - Ensure role-based routing redirects work correctly, all dashboard pages render without errors, AI score badges and urgency labels display correctly, and notification polling functions. Ask the user if questions arise.
+
+- [x] 21. Seed script
+  - Create `backend/src/seed.ts` that:
+    - Inserts 3 Restaurant accounts and 3 NGO accounts with hashed passwords and varied locations
+    - Inserts 10 FoodListings with varied `status` (`available`, `claimed`, `delivered`), food types, quantities, and expiry datetimes (including some expiring within 2 hours and some within 6 hours for urgency label demo)
+    - Inserts 5 FoodRequests linking NGOs to listings
+    - Clears existing seed data before re-inserting (idempotent)
+  - Add `"seed": "ts-node src/seed.ts"` script to `backend/package.json`
+  - _Requirements: 12.1_
+
+- [x] 22. README and deployment documentation
+  - Create root `README.md` with sections:
+    - Prerequisites (Node.js version, MongoDB)
+    - Environment variable setup (copy `.env.example`, fill values — including `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `APP_BASE_URL`)
+    - Install dependencies (`npm install` in `backend/` and `frontend/`)
+    - Run seed script (`npm run seed` in `backend/`)
+    - Start backend (`npm run dev` in `backend/`)
+    - Start frontend (`npm run dev` in `frontend/`)
+    - Run tests (`npm test` in `backend/`)
+    - Deployment:
+      - Frontend → Vercel: set `VITE_API_URL` to the Render backend URL; connect GitHub repo and deploy
+      - Backend → Render: create a Web Service, set all env vars from `.env.example`, set build command `npm install && npm run build`, start command `node dist/server.js`
+      - Database → MongoDB Atlas: create free cluster, whitelist Render IP, copy connection string to `MONGO_URI`
+  - _Requirements: 12.2, 12.3, 12.4, 16.1, 16.2, 16.3, 16.4_
+
+- [x] 23. Final checkpoint — all tests pass
+  - Ensure all unit tests, property-based tests, and integration tests pass with `npm test` in `backend/`. Ask the user if questions arise.
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for a faster MVP
+- Property tests use `fast-check` with `numRuns: 100` minimum
+- Each property test references its property number and the requirements clause it validates
+- Integration tests use `supertest` + `mongodb-memory-server` (no live DB required)
+- Environment variables must never be hard-coded; use `.env.example` as the template
+- The seed script must be idempotent (safe to run multiple times)
